@@ -1,0 +1,6 @@
+# ACP Hub: delegate to external ACP agents and stream live progress into
+# native DSH child sessions. User additions/edits persist in ~/.dsh/acp-hub.json.
+- insert:
+    - id: acp-hub
+      name: 'dsh-acp-hub'
+      config: {}

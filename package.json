@@ -1,0 +1,77 @@
+{
+  "name": "dsh-acp-hub",
+  "version": "0.6.0",
+  "type": "module",
+  "description": "Delegate tasks asynchronously to external ACP agents (MiniMax, OpenCode, Codex, Claude Code, CodeBuddy, Qoder, ZCode, Gemini) in DeepSeek Harness with live native child-session streaming, per-step token accounting, and dynamic session MCP linkage.",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "acp",
+    "agent-client-protocol",
+    "mcp",
+    "subagent"
+  ],
+  "author": "Liang-HZ",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Liang-HZ/dsh-acp-hub.git"
+  },
+  "homepage": "https://github.com/Liang-HZ/dsh-acp-hub#readme",
+  "bugs": {
+    "url": "https://github.com/Liang-HZ/dsh-acp-hub/issues"
+  },
+  "icon": "./icon.svg",
+  "main": "./index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./icon": "./icon.svg",
+    "./locale/*.json": "./locale/*.json",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "scripts": {
+    "test:contract": "node --check index.js && node --check client.js && node --input-type=module -e \"import { runHostContractSmokeTest } from './index.js'; await runHostContractSmokeTest();\""
+  },
+  "dependencies": {
+    "@agentclientprotocol/sdk": "1.5.1"
+  },
+  "engines": {
+    "node": ">=22.0.0",
+    "dsh": ">=0.2.2-rc.1"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "id": "dsh-acp-hub",
+      "platform": "web",
+      "external": [
+        "react",
+        "react-dom"
+      ],
+      "inject": [
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-conversation",
+        "@deepseek-ai/dsh-client-ui-layout",
+        "@deepseek-ai/dsh-client-ui-sidebar",
+        "@deepseek-ai/dsh-client-ui-tool",
+        "@deepseek-ai/dsh-client-ui-workspace"
+      ]
+    }
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "icon.svg",
+    "assets/",
+    "locale/*.json",
+    "icons/*",
+    "README.md",
+    "LICENSE"
+  ]
+}

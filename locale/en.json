@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "ACP Hub",
+    "description": "Delegate tasks asynchronously to external ACP agents with live native child-session streaming, multi-turn resume, and read-only MCP & Skills introspection."
+  }
+}

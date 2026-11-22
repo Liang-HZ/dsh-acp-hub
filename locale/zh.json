@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "ACP Hub（委派中枢）",
+    "description": "将任务异步委派给任意外部 ACP 智能体（ZCode、MiniMax、CodeBuddy、OpenCode、Codex 等），实时流式镜像至 DSH 原生子会话，并透视其原生 MCP 与 Skills。"
+  }
+}
