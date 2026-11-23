@@ -1153,6 +1153,7 @@ const ZCODE_DEFAULT_ENABLED_PLUGINS = new Set([
   'plugin-creator',
   'skill-creator',
   'zcode-guide',
+  'zcode-site',
 ])
 
 function scanZcodePluginSkills(home, disabledPaths, enabledPluginsMap) {
