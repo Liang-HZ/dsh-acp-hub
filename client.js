@@ -264,8 +264,9 @@ window.__ModuleLoader__.load({
       '.acpRoFrame strong{color:var(--dsw-alias-label-primary);font-weight:510}',
 
       /* Subagent Bottom Stats Dock (`ActivityPill` + `UsagePill` + `ContextMeter`) */
-      '.acpDock{display:flex;align-items:center;justify-content:center;gap:12px;max-width:100%;padding-top:4px;flex-wrap:wrap}',
-      '.acpDock:empty{display:none}',
+      '.acpDock{display:flex;align-items:center;justify-content:center;gap:12px;max-width:100%;min-height:calc(22px + var(--dsh-content-font-delta-secondary, 0px));padding-top:4px;flex-wrap:wrap}',
+      '.acpDockPulse{display:inline-block;width:6px;height:6px;border-radius:999px;background:var(--dsw-alias-button-info-fill, #3964FE);animation:acpPulse 1.4s ease-in-out infinite}',
+      '@keyframes acpPulse{0%,100%{opacity:1}50%{opacity:.35}}',
       '.acpStatAnchor{display:inline-flex;min-width:0;font-size:calc(var(--dsh-content-font-size-secondary, 13px) - 1px);line-height:calc(20px + var(--dsh-content-font-delta-secondary, 0px))}',
       '.acpStatPill{display:inline-flex;align-items:center;gap:6px;box-sizing:border-box;max-width:100%;padding:1px 8px;border:none;border-radius:999px;background:transparent;color:var(--dsw-alias-label-tertiary);font:inherit;font-variant-numeric:tabular-nums;line-height:inherit;white-space:nowrap}',
       '.acpStatPill svg{width:14px;height:14px;flex:none}',
@@ -306,6 +307,43 @@ window.__ModuleLoader__.load({
       '@media (max-width:980px){.acpInspectorSplit{grid-template-columns:minmax(0,1fr)}.acpInspColBody{max-height:none}}',
       '@media (max-width:880px){.acpHubPage{flex-direction:column}.acpHubRail{flex:0 0 auto;width:100%;max-height:38%;border-right:none;border-bottom:1px solid var(--dsw-alias-border-l2)}.acpHubGrid,.acpHubRadioGroup{grid-template-columns:minmax(0,1fr)}}',
     ].join('')
+
+    function ensureStylesInjected() {
+      if (typeof document === 'undefined' || !document.head) return false
+      let styleEl = typeof document.getElementById === 'function'
+        ? document.getElementById('dsh-acp-hub-styles')
+        : null
+      if (!styleEl) {
+        styleEl = document.createElement('style')
+        styleEl.id = 'dsh-acp-hub-styles'
+        styleEl.textContent = STYLES
+        document.head.appendChild(styleEl)
+      } else if (styleEl.textContent !== STYLES) {
+        styleEl.textContent = STYLES
+      }
+      return true
+    }
+
+    const sessionInfoCache = new Map()
+    const MAX_SESSION_INFO_CACHE = 200
+
+    function seedSessionInfoCache(childId, partial) {
+      const id = String(childId || '').trim()
+      if (!id || !partial || typeof partial !== 'object') return null
+      const prev = sessionInfoCache.get(id) || {}
+      const merged = { ...prev }
+      for (const [k, v] of Object.entries(partial)) {
+        if (v !== undefined && v !== '') merged[k] = v
+      }
+      merged.childId = id
+      sessionInfoCache.delete(id)
+      sessionInfoCache.set(id, merged)
+      if (sessionInfoCache.size > MAX_SESSION_INFO_CACHE) {
+        const oldest = sessionInfoCache.keys().next().value
+        if (oldest !== undefined) sessionInfoCache.delete(oldest)
+      }
+      return merged
+    }
 
     async function request(url, options) {
       const response = await fetch(url, { credentials: 'same-origin', ...options })
@@ -1061,7 +1099,6 @@ window.__ModuleLoader__.load({
             maxHeight: `${rect.maxHeight}px`,
           },
         },
-        h('style', null, STYLES),
         showSearch
           ? h('div', { className: 'acpSelSearchBox' },
             h(SearchIcon),
@@ -1487,7 +1524,6 @@ window.__ModuleLoader__.load({
           'aria-label': title,
           style: pos || { visibility: 'hidden', left: 0, top: 0 },
         },
-        h('style', null, STYLES),
         h('div', { className: 'acpStatDlgTitle' },
           h('span', { className: 'acpStatDlgLabel' }, icon, title),
           titleValue !== undefined ? h('span', { className: 'acpStatDlgVal' }, titleValue) : null),
@@ -1633,7 +1669,6 @@ window.__ModuleLoader__.load({
           'aria-label': tConv('context.used'),
           style: pos || { visibility: 'hidden', left: 0, top: 0 },
         },
-        h('style', null, STYLES),
         h('div', { className: 'acpCtxHdr' },
           h('span', { className: 'acpCtxHeadline' }, headBefore),
           h('span', { className: 'acpCtxPercent' }, reading),
@@ -1692,7 +1727,7 @@ window.__ModuleLoader__.load({
       }
     }
 
-    function SubagentStatsDockInner({ useProjection, useChat }) {
+    function SubagentStatsDockInner({ useProjection, useChat, running = false, round = 1, startedAt = null }) {
       useExternalRevision(runtimeCtx?.locale)
       const mode = usePerformanceUsageMode()
       const projectedStats = typeof useProjection === 'function' ? useProjection('sessionStats') : undefined
@@ -1700,6 +1735,7 @@ window.__ModuleLoader__.load({
       const tokenUsage = typeof useProjection === 'function' ? useProjection('tokenUsage') : undefined
       const contextPressure = typeof useProjection === 'function' ? useProjection('contextPressure') : undefined
       const contextBreakdown = typeof useProjection === 'function' ? useProjection('contextBreakdown') : undefined
+      const timing = typeof useProjection === 'function' ? useProjection('subagentTiming') : undefined
 
       const stats = React.useMemo(
         () => projectedStats ?? deriveWindowStats(settledNodes),
@@ -1707,11 +1743,30 @@ window.__ModuleLoader__.load({
       )
       const tChat = makeTranslator('chat', FALLBACK_CHAT_ZH)
       const tConv = makeTranslator('conversation', FALLBACK_CONV_ZH)
+      const liveRunning = Boolean(running || timing?.active?.since != null)
+      const liveRound = Math.max(1, Number(round || 1))
+      const showLiveActivity = mode !== 'off' && !(stats?.steps > 0) && liveRunning
+      const hasContextOccupancy = computeContextOccupancy(contextPressure) !== null
+      const liveContextWindow = Number(contextPressure?.contextWindow || 0)
 
       return h('div', { className: 'acpDock', 'data-composer-dock': '' },
-        h(SubagentActivityPill, { stats, mode, tChat }),
+        showLiveActivity
+          ? h(PlainStatPill, {
+            stat: 'activity',
+            icon: h('span', { className: 'acpDockPulse', 'aria-hidden': 'true' }),
+            label: `第 ${liveRound} 轮 · 执行中`,
+          })
+          : h(SubagentActivityPill, { stats, mode, tChat }),
         h(SubagentUsagePill, { usage: tokenUsage, mode, tChat }),
-        h(SubagentContextMeter, { pressure: contextPressure, breakdown: contextBreakdown, tConv }))
+        hasContextOccupancy
+          ? h(SubagentContextMeter, { pressure: contextPressure, breakdown: contextBreakdown, tConv })
+          : (liveContextWindow > 0
+            ? h(PlainStatPill, {
+              stat: 'context',
+              icon: h(DatabaseIcon),
+              label: `上下文 ${formatTokensCompact(liveContextWindow, tConv)}`,
+            })
+            : null))
     }
 
     function SubagentStatsDock(props) {
@@ -1719,12 +1774,12 @@ window.__ModuleLoader__.load({
     }
 
     function NativeSubagentReadOnlyWithDock({ matched, useProjection, useChat }) {
+      ensureStylesInjected()
       useExternalRevision(runtimeCtx?.locale)
       const tSub = makeTranslator('subagent', FALLBACK_SUBAGENT_ZH)
       const reason = matched?.reason || 'one-shot'
       const oneShot = reason === 'one-shot'
       return h('div', { className: 'acpInRoot' },
-        h('style', null, STYLES),
         h('div', { className: 'acpRoFrame', role: 'status' },
           h('strong', null, tSub(oneShot ? 'readonly.oneShot.title' : 'readonly.title')),
           h('span', null, tSub(
@@ -1734,7 +1789,7 @@ window.__ModuleLoader__.load({
                 ? 'readonly.oneShot.body'
                 : 'readonly.body',
           ))),
-        h(SubagentStatsDock, { useProjection, useChat }))
+        h(SubagentStatsDock, { useProjection, useChat, running: Boolean(matched?.running) }))
     }
 
     /* ---------------------------------------------------------------------- */
@@ -1755,21 +1810,53 @@ window.__ModuleLoader__.load({
     }
 
     function AcpSubagentComposer({ matched, useProjection, useChat, initialInfo = null }) {
+      ensureStylesInjected()
       const childId = matched?.sessionId || ''
       const hostRunning = Boolean(matched?.running)
-      const [info, setInfo] = React.useState(initialInfo)
+      const readInitialInfo = () => {
+        if (initialInfo) return initialInfo
+        const cached = childId ? sessionInfoCache.get(childId) || null : null
+        if (!cached) return null
+        return !hostRunning && cached.running ? { ...cached, running: false } : cached
+      }
+      const [info, setInfo] = React.useState(readInitialInfo)
+      const [prevHostRunning, setPrevHostRunning] = React.useState(hostRunning)
+      const prevChildIdRef = React.useRef(childId)
       const [stopping, setStopping] = React.useState(false)
       const [sending, setSending] = React.useState(false)
       const [promptText, setPromptText] = React.useState('')
       const [notifyParent, setNotifyParent] = React.useState(false)
       const [err, setErr] = React.useState('')
       const textareaRef = React.useRef(null)
+      const subagentDesc = typeof useProjection === 'function' ? useProjection('subagent') : undefined
+
+      React.useEffect(() => {
+        if (prevChildIdRef.current !== childId) {
+          prevChildIdRef.current = childId
+          setInfo(readInitialInfo())
+        }
+      }, [childId, initialInfo, hostRunning])
+
+      if (prevHostRunning !== hostRunning) {
+        setPrevHostRunning(hostRunning)
+        if (prevHostRunning && !hostRunning && info?.running) {
+          setInfo({ ...info, running: false })
+        }
+      }
+
+      React.useEffect(() => {
+        if (!hostRunning && childId && sessionInfoCache.get(childId)?.running) {
+          seedSessionInfoCache(childId, { running: false })
+        }
+      }, [childId, hostRunning])
 
       const refreshInfo = React.useCallback(async () => {
         if (!childId || typeof fetch !== 'function') return
         try {
           const res = await request(`${API_SESSION}?childId=${encodeURIComponent(childId)}`)
-          setInfo(res.session || null)
+          const next = res.session || null
+          if (next) seedSessionInfoCache(childId, next)
+          setInfo(next)
         } catch {}
       }, [childId])
 
@@ -1777,7 +1864,7 @@ window.__ModuleLoader__.load({
         void refreshInfo()
       }, [refreshInfo, hostRunning])
 
-      const isRunning = hostRunning || Boolean(info?.running)
+      const isRunning = hostRunning || (prevHostRunning && !hostRunning ? false : Boolean(info?.running))
 
       React.useEffect(() => {
         if (!isRunning) {
@@ -1846,14 +1933,13 @@ window.__ModuleLoader__.load({
         }
       }
 
-      const label = info?.label || 'ACP 子智能体'
+      const label = info?.label || subagentDesc?.label || 'ACP 子智能体'
       const agentId = info?.agentId || ''
       const round = info?.round || 1
       const isReadOnly = !isRunning && Boolean(info) && (info.allowResume === false || !info.canResume)
 
       if (isReadOnly) {
         return h('div', { className: 'acpInRoot' },
-          h('style', null, STYLES),
           h('div', { className: 'acpRoFrame', role: 'status' },
             h('strong', null, info.allowResume === false
               ? `${label} · 独立子会话已完成`
@@ -1861,7 +1947,7 @@ window.__ModuleLoader__.load({
             h('span', null, info.allowResume === false
               ? '已在配置中关闭「同子会话续接」，每次委派均保持独立干净上下文。'
               : '该外部 ACP 智能体未声明会话恢复能力，请在主会话发起新委派。')),
-          h(SubagentStatsDock, { useProjection, useChat }))
+          h(SubagentStatsDock, { useProjection, useChat, running: isRunning, round, startedAt: info?.startedAt ?? null }))
       }
 
       const inputDisabled = isRunning || sending
@@ -1880,7 +1966,6 @@ window.__ModuleLoader__.load({
       }
 
       return h('div', { className: 'acpInRoot' },
-        h('style', null, STYLES),
         err ? h('div', { className: 'acpInNotice', role: 'alert' }, err) : null,
         h('form', {
           className: 'acpInCard',
@@ -1950,7 +2035,7 @@ window.__ModuleLoader__.load({
                 title: '发送消息 (Enter)',
                 onMouseDown: e => e.preventDefault(),
               }, h(SendArrowSvg))))),
-        h(SubagentStatsDock, { useProjection, useChat }))
+        h(SubagentStatsDock, { useProjection, useChat, running: isRunning, round, startedAt: info?.startedAt ?? null }))
     }
 
     /* ---------------------------------------------------------------------- */
@@ -1967,6 +2052,7 @@ window.__ModuleLoader__.load({
     }
 
     function AcpAgentCall({ toolName, phase, block, useSessions, useSessionStatus }) {
+      ensureStylesInjected()
       const meta = phase === 'result' && block?.meta && typeof block.meta === 'object' ? block.meta : {}
       const callArgs = readCallArgs(block)
       const agentId = String(
@@ -1986,6 +2072,16 @@ window.__ModuleLoader__.load({
       const open = childId && parentSessionId && workspace?.openSession
         ? () => {
           try {
+            seedSessionInfoCache(childId, {
+              childId,
+              agentId,
+              label,
+              model,
+              round,
+              running,
+              startedAt,
+              parentSessionId,
+            })
             workspace.openSession({
               parentSessionId,
               childSessionId: childId,
@@ -2052,7 +2148,6 @@ window.__ModuleLoader__.load({
       }
 
       return h('div', { className: 'acpAgentCallWrap' },
-        h('style', null, STYLES),
         h(open ? 'button' : 'div', {
           className: 'acpAgentCall',
           ...(open ? { type: 'button', onClick: open, title: `点击打开 ${label} 实时子会话` } : {}),
@@ -3091,8 +3186,8 @@ window.__ModuleLoader__.load({
       const envEntriesCount = React.useMemo(() => Object.keys(textToEnv(draft?.envText)).length, [draft?.envText])
       const linkedReasoning = resolveReasoningForModel(cat, draft?.model)
 
+      ensureStylesInjected()
       return h('section', { className: 'acpHubPage' },
-        h('style', null, STYLES),
 
         /* Left Master Rail */
         h('aside', { className: 'acpHubRail' },
@@ -3552,13 +3647,15 @@ window.__ModuleLoader__.load({
       if (typeof sid === 'string' && sid.startsWith('session-acp-')) return null
       const subagent = owner?.session?.subagent
       if (!subagent) return null
-      if (subagent.address?.mode === 'unknown') return { reason: 'unknown' }
-      if (subagent.address?.mode === 'one-shot') return { reason: 'one-shot' }
+      const running = Boolean(owner?.session?.running)
+      if (subagent.address?.mode === 'unknown') return { reason: 'unknown', running }
+      if (subagent.address?.mode === 'one-shot') return { reason: 'one-shot', running }
       return null
     }
 
     function apply(ctx) {
       runtimeCtx = ctx
+      ensureStylesInjected()
       const bus = createResetBus()
 
       if (ctx.locale?.register) {
@@ -3640,6 +3737,9 @@ window.__ModuleLoader__.load({
         NativeInspectorTab,
         selectAcpSubagentComposer,
         selectNativeReadOnlySubagent,
+        ensureStylesInjected,
+        sessionInfoCache,
+        seedSessionInfoCache,
       },
     }
   },

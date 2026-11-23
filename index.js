@@ -2492,10 +2492,11 @@ export function resolveAgentContextWindow(family, specModel = '', catalogCurrent
 
   const leaf = normalizeModelLeafForWindow(effectiveModel)
   if (leaf) {
+    if (/claude/i.test(leaf)) return 200_000
+    if (/magpie/i.test(effectiveModel)) return 1_000_000
     if (/minimax-m3|m3\.1|\bm3\b/i.test(leaf)) return 512_000
     if (/dfmodel|deepseek-flash|deepseek-v4|glm-5\.3|qfmodel|qwen3\.8|gemini/i.test(leaf)) return 1_000_000
     if (/gpt-5|codex/i.test(leaf)) return 400_000
-    if (/claude/i.test(leaf)) return 200_000
     if (/kimi|moonshot|step-5|stepfun/i.test(leaf)) return 256_000
     if (/deepseek/i.test(leaf)) return 128_000
   }
@@ -2554,6 +2555,37 @@ export function safeAppendEvent(session, type, data, opts = undefined, ctx = und
   }
 }
 
+const sessionStreamCounters = new Map()
+
+function getSessionStreamCounter(sessionId) {
+  const key = String(sessionId || '')
+  let counter = sessionStreamCounters.get(key)
+  if (!counter) {
+    counter = { attemptNo: 0, revision: 0 }
+  } else {
+    sessionStreamCounters.delete(key)
+  }
+  sessionStreamCounters.set(key, counter)
+  if (sessionStreamCounters.size > MAX_STORED_SESSIONS) {
+    const oldest = sessionStreamCounters.keys().next().value
+    if (oldest !== undefined) sessionStreamCounters.delete(oldest)
+  }
+  return counter
+}
+
+export function extractAcpChunkText(content) {
+  if (!content) return ''
+  if (typeof content === 'string') return content
+  if (Array.isArray(content)) return content.map(extractAcpChunkText).join('')
+  if (typeof content === 'object') {
+    if ((!content.type || content.type === 'text' || content.type === 'thinking' || content.type === 'reasoning') && typeof content.text === 'string') {
+      return content.text
+    }
+    if (typeof content.thinking === 'string') return content.thinking
+  }
+  return ''
+}
+
 export class AcpMirrorStream {
   constructor(ctx, session, modelLabel, turnNo = 1, options = {}) {
     this.ctx = ctx
@@ -2562,8 +2594,7 @@ export class AcpMirrorStream {
     this.model = String(modelLabel || 'acp-model')
     this.turn = turnNo
     this.agent = { id: session.id, session }
-    this.attemptNo = 0
-    this.revision = 0
+    this._streamCounter = getSessionStreamCounter(session?.id)
     this.attempt = undefined
     this.activeBlock = undefined
     this.blocks = []
@@ -2575,6 +2606,22 @@ export class AcpMirrorStream {
     this.sawCacheWritePositive = false
     this.zcodeRowsConsumed = 0
     this.resolveStepUsage = typeof options.resolveStepUsage === 'function' ? options.resolveStepUsage : null
+  }
+
+  get attemptNo() {
+    return this._streamCounter.attemptNo
+  }
+
+  set attemptNo(val) {
+    this._streamCounter.attemptNo = val
+  }
+
+  get revision() {
+    return this._streamCounter.revision
+  }
+
+  set revision(val) {
+    this._streamCounter.revision = val
   }
 
   zeroStepUsage() {
@@ -2735,6 +2782,11 @@ export class AcpMirrorStream {
           { isFinal: true },
         )
       }
+      if (stepUsage !== undefined) {
+        this.chunk({ type: 'usage', usage: stepUsage })
+      }
+      const hasToolCalls = this.blocks.some(b => b?.type === 'tool-call')
+      this.chunk({ type: 'finish', reason: { kind: hasToolCalls ? 'tool-calls' : 'stop' } })
       const seq = this.session.append('assistant/message', {
         turn: this.turn,
         step: this.step,
@@ -3519,12 +3571,8 @@ async function runAcp(parentAgentOrNull, ctx, spec, rawTask, agentKey, toolName,
   const catalogCurrent = lookupCachedCatalogCurrent(resolvedCommand, spec)
   const effectiveModel = extractEffectiveModelHint(family, spec.model, catalogCurrent)
   let lastContextWindow = resolveAgentContextWindow(family, spec.model, catalogCurrent)
+  let pendingContextWindow = 0
 
-  childSession.append('turn/start', { turn: turnNo })
-  if (lastContextWindow > 0) {
-    safeAppendEvent(childSession, 'request/context', { contextWindow: lastContextWindow }, undefined, ctx)
-  }
-  childSession.append('step/start', { turn: turnNo, step: 1 })
   if (acquired.isNewSession) {
     safeAppendEvent(childSession, 'subagent/descriptor', {
       version: 3,
@@ -3533,6 +3581,11 @@ async function runAcp(parentAgentOrNull, ctx, spec, rawTask, agentKey, toolName,
       label: badgeLabel,
     }, undefined, ctx)
   }
+  childSession.append('turn/start', { turn: turnNo })
+  if (lastContextWindow > 0) {
+    safeAppendEvent(childSession, 'request/context', { contextWindow: lastContextWindow }, undefined, ctx)
+  }
+  childSession.append('step/start', { turn: turnNo, step: 1 })
 
   const finalPromptText = composeTaskPrompt(spec, rawTask, Boolean(priorRecord))
   childSession.append('user/message', {
@@ -3582,8 +3635,17 @@ async function runAcp(parentAgentOrNull, ctx, spec, rawTask, agentKey, toolName,
     deferredChunks: [],
   }
 
+  const flushPendingContextWindow = () => {
+    if (pendingContextWindow > 0 && pendingContextWindow !== lastContextWindow && !stream.attempt) {
+      lastContextWindow = pendingContextWindow
+      pendingContextWindow = 0
+      safeAppendEvent(childSession, 'request/context', { contextWindow: lastContextWindow }, undefined, ctx)
+    }
+  }
+
   const advanceToNextStep = () => {
     stream.nextStep()
+    flushPendingContextWindow()
     state.toolResultSeen = false
     state.stepText = ''
   }
@@ -3667,6 +3729,17 @@ async function runAcp(parentAgentOrNull, ctx, spec, rawTask, agentKey, toolName,
     return true
   }
 
+  activeRuns.set(childId, {
+    childId,
+    parentSessionId,
+    agentId: agentKey,
+    label: spec.name,
+    model: spec.model || effectiveModel || '',
+    round: turnNo,
+    startedAt,
+    cancel: cancelRun,
+  })
+
   try {
     child = ctx.subprocess.spawn({
       argv: [resolvedCommand, ...spec.args],
@@ -3694,12 +3767,12 @@ async function runAcp(parentAgentOrNull, ctx, spec, rawTask, agentKey, toolName,
           try {
             switch (update.sessionUpdate) {
               case 'agent_message_chunk': {
-                const chunk = update.content?.type === 'text' ? update.content.text : ''
+                const chunk = extractAcpChunkText(update.content)
                 handleStreamChunk({ type: 'text', text: chunk, trackAsAnswer: true })
                 break
               }
               case 'agent_thought_chunk': {
-                const chunk = update.content?.type === 'text' ? update.content.text : ''
+                const chunk = extractAcpChunkText(update.content)
                 handleStreamChunk({ type: 'reasoning', text: chunk, trackAsAnswer: false })
                 break
               }
@@ -3721,8 +3794,13 @@ async function runAcp(parentAgentOrNull, ctx, spec, rawTask, agentKey, toolName,
               case 'usage_update': {
                 state.contextUsage = update
                 if (typeof update.size === 'number' && Number.isSafeInteger(update.size) && update.size > 0 && update.size !== lastContextWindow) {
-                  lastContextWindow = update.size
-                  safeAppendEvent(childSession, 'request/context', { contextWindow: update.size }, undefined, ctx)
+                  if (!stream.attempt) {
+                    lastContextWindow = update.size
+                    pendingContextWindow = 0
+                    safeAppendEvent(childSession, 'request/context', { contextWindow: update.size }, undefined, ctx)
+                  } else {
+                    pendingContextWindow = update.size
+                  }
                 }
                 break
               }
@@ -3824,7 +3902,9 @@ async function runAcp(parentAgentOrNull, ctx, spec, rawTask, agentKey, toolName,
       throw new Error('ACP 智能体未返回有效 sessionId')
     }
 
+    if (state.cancelled) throw new Error('ACP run cancelled before selection')
     await applyAcpSelection(ctx, agent, remoteSessionId, spec)
+    if (state.cancelled) throw new Error('ACP run cancelled before prompt dispatch')
 
     recordContinuationEntry(childId, {
       remoteSessionId,
@@ -3845,17 +3925,6 @@ async function runAcp(parentAgentOrNull, ctx, spec, rawTask, agentKey, toolName,
     consumedSqliteRowIds = Array.isArray(initialSqliteRows)
       ? new Set(initialSqliteRows.map(r => r.id))
       : null
-
-    activeRuns.set(childId, {
-      childId,
-      parentSessionId,
-      agentId: agentKey,
-      label: spec.name,
-      model: spec.model || effectiveModel || '',
-      round: turnNo,
-      startedAt,
-      cancel: cancelRun,
-    })
 
     const resolveParentAgent = () => {
       if (parentAgentOrNull && typeof parentAgentOrNull.followup === 'function') return parentAgentOrNull
@@ -3908,6 +3977,7 @@ async function runAcp(parentAgentOrNull, ctx, spec, rawTask, agentKey, toolName,
         stream.finishAll(finalUsage, finalRoute)
         state.finished = true
         childSession.append('step/end', { turn: turnNo, step: stream.step })
+        flushPendingContextWindow()
         childSession.append('turn/end', {
           turn: turnNo,
           reason: { kind: stop === 'completed' ? 'completed' : (stop === 'aborted' ? 'aborted' : 'error') },
@@ -3961,6 +4031,7 @@ async function runAcp(parentAgentOrNull, ctx, spec, rawTask, agentKey, toolName,
         )
         stream.finishAll(finalUsage, finalRoute)
         childSession.append('step/end', { turn: turnNo, step: stream.step })
+        flushPendingContextWindow()
         childSession.append('turn/end', { turn: turnNo, reason: { kind: stop === 'aborted' ? 'aborted' : 'error' } })
         publishMirrorStatus(ctx, mirrorAgent, 'idle')
         const targetParent = notifyParent ? resolveParentAgent() : null
@@ -4682,6 +4753,7 @@ export function apply(ctx, config = {}) {
             label: active?.label || spec?.name || ledger?.label || (agentId || 'ACP'),
             model: resolvedModel,
             round: active?.round ?? Number(ledger?.turn ?? 1),
+            startedAt: active?.startedAt ?? null,
             allowResume: spec ? spec.allowResume !== false : true,
             remoteResumable: Boolean(ledger?.canResume),
             canResume: Boolean(ledger?.canResume) && Boolean(spec && spec.enabled !== false && spec.allowResume !== false),
@@ -5216,6 +5288,63 @@ export async function runHostContractSmokeTest() {
     writeFileSync(legPath, JSON.stringify({ version: 3, promptDisclosure: 'compact', agents: { custom: { command: '/bin/sh', args: [] } }, deleted: [] }))
     const loadedLegacy = loadMergedSettings({}, newPath, legPath)
     assert.ok(loadedLegacy.map.has('custom'), 'legacy settings must migrate seamlessly')
+
+    // 7. Context window resolution, chunk extraction, usage+finish frames & monotonic revisions across turns
+    assert.equal(resolveAgentContextWindow('minimax', 'magpie/auto/minimax-m3.1-flash'), 1_000_000)
+    assert.equal(resolveAgentContextWindow('minimax', 'magpie/auto/claude-sonnet-4'), 200_000)
+    assert.equal(resolveAgentContextWindow('minimax', 'minimax-m3.1-flash'), 512_000)
+
+    assert.equal(extractAcpChunkText('plain'), 'plain')
+    assert.equal(extractAcpChunkText({ type: 'text', text: 'hello' }), 'hello')
+    assert.equal(extractAcpChunkText({ type: 'thinking', text: 'thought' }), 'thought')
+    assert.equal(extractAcpChunkText({ text: 'bare' }), 'bare')
+    assert.equal(extractAcpChunkText([{ type: 'text', text: 'a' }, { type: 'text', text: 'b' }]), 'ab')
+    assert.equal(extractAcpChunkText({ type: 'image', text: 'ignored' }), '')
+
+    const emittedFrames = []
+    const streamCtx = {
+      emit(evt, data) {
+        if (evt === 'agent/assistant-stream') emittedFrames.push(data.frame)
+      },
+    }
+    const multiSession = createMemorySession(`session-acp-contract-multi-${Date.now()}`)
+    multiSession.append('subagent/descriptor', { version: 3, mode: 'one-shot', provider: 'acp-hub', label: 'MiniMax' })
+    multiSession.append('turn/start', { turn: 1 })
+    multiSession.append('request/context', { contextWindow: 1_000_000 })
+    multiSession.append('step/start', { turn: 1, step: 1 })
+
+    const sTurn1 = new AcpMirrorStream(streamCtx, multiSession, 'magpie/auto/minimax-m3.1-flash', 1, { provider: 'minimax' })
+    sTurn1.tool({ toolCallId: 'tc-1', title: 'bash', rawInput: { cmd: 'ls' } })
+    sTurn1.nextStep()
+    sTurn1.append('text', 'Turn 1 answer')
+    sTurn1.finishAll({ inputTokens: 120, outputTokens: 30, cacheReadTokens: 0, totalTokens: 150 })
+    multiSession.append('step/end', { turn: 1, step: sTurn1.step })
+    multiSession.append('turn/end', { turn: 1, reason: { kind: 'completed' } })
+
+    const t1Chunks = emittedFrames.filter(f => f.type === 'chunk').map(f => f.chunk)
+    assert.ok(t1Chunks.some(c => c.type === 'finish' && c.reason?.kind === 'tool-calls'), 'tool step must emit tool-calls finish chunk')
+    assert.ok(t1Chunks.some(c => c.type === 'usage' && c.usage?.totalTokens === 150), 'final step must emit usage chunk')
+    assert.ok(t1Chunks.some(c => c.type === 'finish' && c.reason?.kind === 'stop'), 'final step must emit stop finish chunk')
+
+    const lastTurn1Rev = emittedFrames.at(-1).revision
+    const framesBeforeTurn2 = emittedFrames.length
+
+    multiSession.append('turn/start', { turn: 2 })
+    multiSession.append('step/start', { turn: 2, step: 1 })
+    const sTurn2 = new AcpMirrorStream(streamCtx, multiSession, 'magpie/auto/minimax-m3.1-flash', 2, { provider: 'minimax' })
+    sTurn2.append('text', 'Turn 2 answer')
+    sTurn2.finishAll({ inputTokens: 200, outputTokens: 40, cacheReadTokens: 50, totalTokens: 290 })
+    multiSession.append('step/end', { turn: 2, step: sTurn2.step })
+    multiSession.append('turn/end', { turn: 2, reason: { kind: 'completed' } })
+
+    assert.equal(emittedFrames[framesBeforeTurn2].type, 'start')
+    assert.equal(emittedFrames[framesBeforeTurn2].revision, lastTurn1Rev + 1, 'Turn 2 start revision must continue monotonically')
+    for (let i = 0; i < emittedFrames.length; i += 1) {
+      assert.equal(emittedFrames[i].revision, i + 1, `frame ${i} revision must be strictly sequential`)
+    }
+    const descIdx = multiSession.events.findIndex(e => e.type === 'subagent/descriptor')
+    const turnIdx = multiSession.events.findIndex(e => e.type === 'turn/start')
+    assert.ok(descIdx >= 0 && turnIdx > descIdx, 'subagent/descriptor must precede turn/start')
   } finally {
     rmSync(scratch, { recursive: true, force: true })
   }
