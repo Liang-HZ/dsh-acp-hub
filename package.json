@@ -1,6 +1,6 @@
 {
   "name": "dsh-acp-hub",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "type": "module",
   "description": "Delegate tasks asynchronously to external ACP agents (MiniMax, OpenCode, Codex, Claude Code, CodeBuddy, Qoder, ZCode, Gemini) in DeepSeek Harness with live native child-session streaming, per-step token accounting, and dynamic session MCP linkage.",
   "keywords": [
